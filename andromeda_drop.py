@@ -1,42 +1,162 @@
-# andromeda_drop.py
+# drop_utils.py
 #
-# Utility module for dropping rows or columns from a pandas DataFrame
-# based on patterns found in cell values.
+# Structural tool for dropping rows/columns from a pandas DataFrame
+# based on presence of one or more patterns in cell values.
 #
-# Features:
-#   - Drop ROWS that contain one or more patterns anywhere.
-#   - Drop COLUMNS that contain one or more patterns anywhere.
-#   - Drop BOTH rows and columns with a single call.
-#   - Case-insensitive search: data and patterns are normalized to lowercase.
-#   - Two modes:
-#       - strict substring search  (regex=False, default)
-#       - regex search            (regex=True)
+# Single, explicit API:
 #
-#   API style matches trimming utilities:
+#   from drop_utils import drop
 #
-#       drop_rows(df)["bmw"]
-#       drop_rows(df)[["bmw", "audi"]]
-#       drop_rows(df)[("bmw", True)]                 # regex=True
-#       drop_rows(df)[("bmw", "audi", True)]         # many patterns + regex
-#       drop_cols(df)[r"^unnamed", True]
-#       drop_both(df)["bmw", "audi", True]
+#   df2 = drop({
+#       "data_frame": df,                 # required
+#       "patterns": ["bmw", "audi"],      # required (str or sequence of str)
+#       "regex": False,                   # optional, default False (substring search)
+#       "rows": True,                     # optional, default True
+#       "cols": False,                    # optional, default False
+#   })
+#
+# There are no shortcuts/proxies here; everything is configured explicitly
+# via a single config dict to keep the API clean and predictable.
 
+from typing import Any, Dict, Iterable, List, Sequence, TypedDict, Union
 
 import pandas as pd
+
+
+# =====================================================================
+#  Public config type
+# =====================================================================
+
+class DropConfig(TypedDict, total=False):
+    """
+    Configuration for drop(...):
+
+        data_frame : pandas.DataFrame           (required)
+        patterns   : str or sequence of str     (required)
+        regex      : bool, default False
+        rows       : bool, default True
+        cols       : bool, default False
+    """
+    data_frame: pd.DataFrame
+    patterns: Union[str, Sequence[str]]
+    regex: bool
+    rows: bool
+    cols: bool
+
+
+_ALLOWED_KEYS = {
+    "data_frame",
+    "patterns",
+    "regex",
+    "rows",
+    "cols",
+}
+
+
+# =====================================================================
+#  Validation helpers
+# =====================================================================
+
+def _require_dataframe(cfg: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Ensure cfg['data_frame'] exists and is a pandas.DataFrame.
+    """
+    if "data_frame" not in cfg:
+        raise KeyError("'data_frame' key is required in drop(...) config")
+
+    df = cfg["data_frame"]
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(
+            f"'data_frame' must be a pandas.DataFrame, got {type(df).__name__}"
+        )
+    return df
+
+
+def _normalize_patterns_raw(patterns: Any) -> List[str]:
+    """
+    Normalize patterns input (which may be a single value or an iterable)
+    into a non-empty list of raw strings (no lowercasing yet).
+    """
+    if isinstance(patterns, (list, tuple, set)):
+        vals = list(patterns)
+    else:
+        vals = [patterns]
+
+    if not vals:
+        raise ValueError("'patterns' must contain at least one element")
+
+    result: List[str] = [str(p) for p in vals]
+    return result
+
+
+def _validate_patterns(cfg: Dict[str, Any]) -> List[str]:
+    """
+    Ensure 'patterns' is provided and normalize it into a list of strings.
+    """
+    if "patterns" not in cfg:
+        raise KeyError("'patterns' key is required in drop(...) config")
+
+    pats = _normalize_patterns_raw(cfg["patterns"])
+    return pats
+
+
+def _validate_bool(name: str, value: Any) -> bool:
+    """
+    Ensure the given value is a bool.
+    """
+    if not isinstance(value, bool):
+        raise TypeError(f"'{name}' must be bool, got {type(value).__name__}")
+    return value
+
+
+def _validate_drop_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate dict-style config for drop({...}).
+
+    Keys:
+        data_frame : pandas.DataFrame           (required)
+        patterns   : str or iterable of str     (required)
+        regex      : bool, default False
+        rows       : bool, default True
+        cols       : bool, default False
+    """
+    unknown = set(cfg.keys()) - _ALLOWED_KEYS
+    if unknown:
+        raise KeyError(f"Unknown configuration key(s) for drop: {sorted(unknown)}")
+
+    df = _require_dataframe(cfg)
+    patterns = _validate_patterns(cfg)
+
+    # defaults
+    resolved: Dict[str, Any] = {
+        "data_frame": df,
+        "patterns": patterns,
+        "regex": False,
+        "rows": True,
+        "cols": False,
+    }
+
+    # regex
+    if "regex" in cfg:
+        resolved["regex"] = _validate_bool("regex", cfg["regex"])
+
+    # rows / cols
+    if "rows" in cfg:
+        resolved["rows"] = _validate_bool("rows", cfg["rows"])
+    if "cols" in cfg:
+        resolved["cols"] = _validate_bool("cols", cfg["cols"])
+
+    return resolved
 
 
 # =====================================================================
 #  Core helpers
 # =====================================================================
 
-def _normalize_patterns(patterns):
+def _normalize_patterns(patterns: Iterable[str]) -> List[str]:
     """
-    Ensure patterns is a list of lowercase, stripped strings.
+    Normalize patterns to a list of lowercase, stripped strings.
     """
-    if patterns is None:
-        return []
-    if not isinstance(patterns, (list, tuple, set)):
-        patterns = [patterns]
     return [str(p).lower().strip() for p in patterns]
 
 
@@ -47,14 +167,18 @@ def _prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(str).apply(lambda col: col.str.lower())
 
 
-def _drop_rows(df: pd.DataFrame, patterns, regex: bool = False) -> pd.DataFrame:
+def _drop_rows(
+        df: pd.DataFrame,
+        patterns: Iterable[str],
+        regex: bool = False,
+) -> pd.DataFrame:
     """
     Drop rows where any cell matches any of the patterns.
     """
     df_copy = df.copy()
-    patterns = _normalize_patterns(patterns)
+    pats = _normalize_patterns(patterns)
 
-    if not patterns or df_copy.empty:
+    if not pats or df_copy.empty:
         return df_copy.reset_index(drop=True)
 
     data = _prepare_data(df_copy)
@@ -62,26 +186,34 @@ def _drop_rows(df: pd.DataFrame, patterns, regex: bool = False) -> pd.DataFrame:
     # Start with "no rows to drop"
     mask = pd.Series(False, index=df_copy.index)
 
-    for p in patterns:
+    for p in pats:
         if regex:
-            m = data.apply(lambda col: col.str.contains(p, regex=True, na=False)).any(axis=1)
+            matches = data.apply(
+                lambda col: col.str.contains(p, regex=True, na=False)
+            ).any(axis=1)
         else:
             # strict substring search (no regex syntax)
-            m = data.apply(lambda col: col.str.contains(p, regex=False, na=False)).any(axis=1)
-        mask |= m
+            matches = data.apply(
+                lambda col: col.str.contains(p, regex=False, na=False)
+            ).any(axis=1)
+        mask |= matches
 
     # Keep only rows that are NOT matched
     return df_copy.loc[~mask].reset_index(drop=True)
 
 
-def _drop_cols(df: pd.DataFrame, patterns, regex: bool = False) -> pd.DataFrame:
+def _drop_cols(
+        df: pd.DataFrame,
+        patterns: Iterable[str],
+        regex: bool = False,
+) -> pd.DataFrame:
     """
     Drop columns where any cell matches any of the patterns.
     """
     df_copy = df.copy()
-    patterns = _normalize_patterns(patterns)
+    pats = _normalize_patterns(patterns)
 
-    if not patterns or df_copy.empty:
+    if not pats or df_copy.empty:
         return df_copy
 
     data = _prepare_data(df_copy)
@@ -89,21 +221,26 @@ def _drop_cols(df: pd.DataFrame, patterns, regex: bool = False) -> pd.DataFrame:
     # Start with "no columns to drop"
     mask = pd.Series(False, index=df_copy.columns)
 
-    for p in patterns:
+    for p in pats:
         if regex:
-            m = data.apply(lambda col: col.str.contains(p, regex=True, na=False))
+            matches = data.apply(
+                lambda col: col.str.contains(p, regex=True, na=False)
+            )
         else:
-            m = data.apply(lambda col: col.str.contains(p, regex=False, na=False))
+            matches = data.apply(
+                lambda col: col.str.contains(p, regex=False, na=False)
+            )
+
         # Any match in a column → mark column for dropping
-        mask |= m.any(axis=0)
+        mask |= matches.any(axis=0)
 
     # Keep only columns that are NOT matched
     return df_copy.loc[:, ~mask]
 
 
-def drop_by_pattern(
+def _drop_by_pattern_core(
         df: pd.DataFrame,
-        patterns,
+        patterns: Iterable[str],
         rows: bool = True,
         cols: bool = False,
         regex: bool = False,
@@ -116,7 +253,7 @@ def drop_by_pattern(
     df : pd.DataFrame
         Input DataFrame.
 
-    patterns : str or list/tuple/set of str
+    patterns : iterable of str
         Patterns to search for (case-insensitive).
         If regex=False → treated as plain substrings.
         If regex=True  → treated as regular expressions.
@@ -136,10 +273,15 @@ def drop_by_pattern(
     pd.DataFrame
         New DataFrame with matching rows/columns removed.
     """
+    rows = _validate_bool("rows", rows)
+    cols = _validate_bool("cols", cols)
+    regex = _validate_bool("regex", regex)
+
     result = df.copy()
 
     if not rows and not cols:
-        return result
+        # nothing to drop, just return a copy
+        return result.reset_index(drop=True)
 
     if rows:
         result = _drop_rows(result, patterns, regex=regex)
@@ -151,124 +293,42 @@ def drop_by_pattern(
 
 
 # =====================================================================
-#  Proxy objects enabling clean syntax:
-#      drop_rows(df)["pattern"]
-#      drop_rows(df)[("pattern1", "pattern2", True)]
+#  Public API
 # =====================================================================
 
-class _DropRowsProxy:
+def drop(config: DropConfig) -> pd.DataFrame:
     """
-    Proxy enabling:
+    Main public entry point.
 
-        drop_rows(df)["bmw"]
-        drop_rows(df)[["bmw", "audi"]]
-        drop_rows(df)[("bmw", True)]                # regex=True
-        drop_rows(df)[("bmw", "audi", True)]        # many patterns + regex flag
+    Expects a dict-like config with keys:
+
+        "data_frame" : pandas.DataFrame          (required)
+        "patterns"   : str or iterable of str    (required)
+
+        "regex"      : bool, default False
+        "rows"       : bool, default True
+        "cols"       : bool, default False
+
+    Behavior:
+        - rows=True  → drop rows containing any pattern.
+        - cols=True  → drop columns containing any pattern.
+        - Both True  → apply rows then columns.
+        - All searches are case-insensitive.
+        - regex=False → substring search (no regex syntax).
+        - regex=True  → regular expressions.
     """
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"drop(...) expects a dict as config, got {type(config).__name__}"
+        )
 
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
+    resolved = _validate_drop_config_dict(config)
 
-    def __getitem__(self, key):
-        """
-        If key is a tuple and the last element is bool → treated as regex flag.
-
-        Examples:
-            "bmw"                           → patterns=["bmw"], regex=False
-            ["bmw", "audi"]                 → patterns=["bmw","audi"], regex=False
-            ("bmw", True)                   → patterns=("bmw",), regex=True
-            ("bmw", "audi", True)           → patterns=("bmw","audi"), regex=True
-            ("bmw", "audi")                 → patterns=("bmw","audi"), regex=False
-        """
-        regex = False
-        patterns = key
-
-        if isinstance(key, tuple):
-            # if last element is bool, treat as regex flag, rest as patterns
-            if len(key) >= 2 and isinstance(key[-1], bool):
-                regex = key[-1]
-                patterns = key[:-1]
-            else:
-                patterns = key
-
-        if not isinstance(patterns, (list, tuple, set)):
-            patterns = [patterns]
-
-        return drop_by_pattern(self.df, patterns, rows=True, cols=False, regex=regex)
-
-
-class _DropColsProxy:
-    """
-    Proxy enabling:
-
-        drop_cols(df)["unnamed"]
-        drop_cols(df)[r"^unnamed", True]
-        drop_cols(df)[("kba", "hersteller", True)]
-    """
-
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
-
-    def __getitem__(self, key):
-        regex = False
-        patterns = key
-
-        if isinstance(key, tuple):
-            if len(key) >= 2 and isinstance(key[-1], bool):
-                regex = key[-1]
-                patterns = key[:-1]
-            else:
-                patterns = key
-
-        if not isinstance(patterns, (list, tuple, set)):
-            patterns = [patterns]
-
-        return drop_by_pattern(self.df, patterns, rows=False, cols=True, regex=regex)
-
-
-class _DropBothProxy:
-    """
-    Proxy enabling:
-
-        drop_both(df)["bmw"]
-        drop_both(df)[["bmw", "audi"]]
-        drop_both(df)[("bmw", "audi", True)]
-    """
-
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
-
-    def __getitem__(self, key):
-        regex = False
-        patterns = key
-
-        if isinstance(key, tuple):
-            if len(key) >= 2 and isinstance(key[-1], bool):
-                regex = key[-1]
-                patterns = key[:-1]
-            else:
-                patterns = key
-
-        if not isinstance(patterns, (list, tuple, set)):
-            patterns = [patterns]
-
-        return drop_by_pattern(self.df, patterns, rows=True, cols=True, regex=regex)
-
-
-# =====================================================================
-#  Public entry points (same style as trim_top / trim_bot)
-# =====================================================================
-
-def drop_rows(df: pd.DataFrame) -> _DropRowsProxy:
-    """Entry point for dropping rows by pattern."""
-    return _DropRowsProxy(df)
-
-
-def drop_cols(df: pd.DataFrame) -> _DropColsProxy:
-    """Entry point for dropping columns by pattern."""
-    return _DropColsProxy(df)
-
-
-def drop_both(df: pd.DataFrame) -> _DropBothProxy:
-    """Entry point for dropping both rows and columns by pattern."""
-    return _DropBothProxy(df)
+    df = resolved["data_frame"]
+    return _drop_by_pattern_core(
+        df,
+        patterns=resolved["patterns"],
+        rows=resolved["rows"],
+        cols=resolved["cols"],
+        regex=resolved["regex"],
+    )

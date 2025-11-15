@@ -1,368 +1,407 @@
-# andromeda_trim.py
+# trim.py
 #
-# Utility module for trimming pandas DataFrames using anchor words.
+# Structural tool for trimming the edges of a pandas DataFrame
+# based on one or more anchor patterns in cell values.
 #
-# Features:
-#   - Trim from TOP, BOTTOM, LEFT, or RIGHT.
-#   - Anchor search is case-insensitive and whitespace-tolerant
-#     (both anchor and data are normalized to lowercase, stripped).
-#   - You can choose whether to keep or remove the row/column containing the anchor.
-#   - Convenient syntax:
+# Single, explicit API:
 #
-#       trim_top(df)["Insgesamt"]          # keep anchor row
-#       trim_top(df)["Insgesamt", False]   # drop anchor row
-#       trim_bot(df)["SONSTIGE"]
-#       trim_left(df)["Marke", False]
+#   from trim import trim
 #
-#   Under the hood it uses a single core function `trim_df`.
+#   df2 = trim({
+#       "data_frame": df,
+#       "top": ("Insgesamt", False),   # (anchor, keep)
+#       "bottom": ("SONSTIGE", True),
+#       "left": ("Marke", True),
+#       "right": ("2024", True),
+#       "max_rows_to_scan": 30,
+#       "max_cols_to_scan": 10,
+#       "match_mode": "equals",       # or "contains" (default)
+#   })
+#
+# There are no shortcuts/proxies here; everything is configured explicitly
+# via a single config dict to keep the API clean and predictable.
 
+from typing import Any, Dict, Optional, Tuple, TypedDict, Literal
 
 import numpy as np
 import pandas as pd
 
+# =====================================================================
+#  Public config type
+# =====================================================================
+
+MatchMode = Literal["contains", "equals"]
+
+
+class TrimConfig(TypedDict, total=False):
+    """
+    Configuration for trim(...):
+
+        data_frame       : pandas.DataFrame              (required)
+        top              : (anchor, keep_bool) or None   (optional)
+        bottom           : (anchor, keep_bool) or None   (optional)
+        left             : (anchor, keep_bool) or None   (optional)
+        right            : (anchor, keep_bool) or None   (optional)
+        max_rows_to_scan : int >= 1, default 20          (optional)
+        max_cols_to_scan : int >= 1, default 20          (optional)
+        match_mode       : "contains" or "equals",
+                           default "contains"            (optional)
+    """
+    data_frame: pd.DataFrame
+    top: Optional[Tuple[str, bool]]
+    bottom: Optional[Tuple[str, bool]]
+    left: Optional[Tuple[str, bool]]
+    right: Optional[Tuple[str, bool]]
+    max_rows_to_scan: int
+    max_cols_to_scan: int
+    match_mode: MatchMode
+
+
+_ALLOWED_KEYS = {
+    "data_frame",
+    "top",
+    "bottom",
+    "left",
+    "right",
+    "max_rows_to_scan",
+    "max_cols_to_scan",
+    "match_mode",
+}
+
 
 # =====================================================================
-#  Core trimming function used internally and by proxy objects
+#  Validation helpers
 # =====================================================================
 
-def trim_df(
+def _require_dataframe(cfg: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Ensure cfg['data_frame'] exists and is a pandas.DataFrame.
+    """
+    if "data_frame" not in cfg:
+        raise KeyError("'data_frame' key is required in trim(...) config")
+
+    df = cfg["data_frame"]
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(
+            f"'data_frame' must be a pandas.DataFrame, got {type(df).__name__}"
+        )
+    return df
+
+
+def _validate_int(name: str, value: Any, minimum: int = 1) -> int:
+    """
+    Ensure the given value is an int and >= minimum.
+    """
+    if not isinstance(value, int):
+        raise TypeError(f"'{name}' must be int, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(f"'{name}' must be >= {minimum}, got {value}")
+    return value
+
+
+def _validate_side(name: str, value: Any) -> Optional[Tuple[str, bool]]:
+    """
+    Validate side anchor config for top/bottom/left/right.
+
+    Allowed:
+        None
+        ("Insgesamt", False)
+        ("Marke", True)
+
+    Returns:
+        None or (anchor_str, keep_bool)
+    """
+    if value is None:
+        return None
+
+    if not isinstance(value, (tuple, list)):
+        raise TypeError(
+            f"'{name}' must be a tuple/list (anchor, keep) or None, "
+            f"got {type(value).__name__}"
+        )
+
+    if len(value) != 2:
+        raise ValueError(
+            f"'{name}' must be a 2-element tuple/list: (anchor, keep_bool), "
+            f"got length {len(value)}"
+        )
+
+    anchor, keep = value
+    anchor_str = str(anchor)
+    if not isinstance(keep, bool):
+        raise TypeError(
+            f"'{name}' second element 'keep' must be bool, got {type(keep).__name__}"
+        )
+
+    return anchor_str, keep
+
+
+def _validate_match_mode(value: Any) -> MatchMode:
+    """
+    Ensure match_mode is one of the supported values.
+    """
+    if not isinstance(value, str):
+        raise TypeError(
+            f"'match_mode' must be a string 'contains' or 'equals', "
+            f"got {type(value).__name__}"
+        )
+
+    mode = value.strip().lower()
+    if mode not in ("contains", "equals"):
+        raise ValueError(
+            f"'match_mode' must be 'contains' or 'equals', got {value!r}"
+        )
+
+    return mode  # type: ignore[return-value]
+
+
+def _validate_trim_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate dict-style config for trim({...}).
+
+    Ensures:
+        - only known keys are present
+        - required 'data_frame' is provided
+        - types and ranges for options are correct
+        - default values are applied for missing fields
+    """
+    unknown = set(cfg.keys()) - _ALLOWED_KEYS
+    if unknown:
+        raise KeyError(f"Unknown configuration key(s) for trim: {sorted(unknown)}")
+
+    df = _require_dataframe(cfg)
+
+    resolved: Dict[str, Any] = {
+        "data_frame": df,
+        "top": None,
+        "bottom": None,
+        "left": None,
+        "right": None,
+        "max_rows_to_scan": 20,
+        "max_cols_to_scan": 20,
+        "match_mode": "contains",  # backward-compatible default
+    }
+
+    # sides
+    if "top" in cfg:
+        resolved["top"] = _validate_side("top", cfg["top"])
+    if "bottom" in cfg:
+        resolved["bottom"] = _validate_side("bottom", cfg["bottom"])
+    if "left" in cfg:
+        resolved["left"] = _validate_side("left", cfg["left"])
+    if "right" in cfg:
+        resolved["right"] = _validate_side("right", cfg["right"])
+
+    # scan windows
+    if "max_rows_to_scan" in cfg:
+        resolved["max_rows_to_scan"] = _validate_int(
+            "max_rows_to_scan",
+            cfg["max_rows_to_scan"],
+            minimum=1,
+        )
+    if "max_cols_to_scan" in cfg:
+        resolved["max_cols_to_scan"] = _validate_int(
+            "max_cols_to_scan",
+            cfg["max_cols_to_scan"],
+            minimum=1,
+        )
+
+    # match mode
+    if "match_mode" in cfg:
+        resolved["match_mode"] = _validate_match_mode(cfg["match_mode"])
+
+    return resolved
+
+
+# =====================================================================
+#  Core helpers
+# =====================================================================
+
+def _row_mask(
+        block: pd.DataFrame,
+        anchor: str,
+        match_mode: MatchMode,
+) -> pd.Series:
+    """
+    Return a boolean Series marking rows that contain the anchor
+    in ANY column of the given block.
+
+    match_mode:
+        "contains" : case-insensitive substring match
+        "equals"   : case-insensitive exact match after strip()
+    """
+    if block.empty:
+        return pd.Series(False, index=block.index)
+
+    a = str(anchor).lower().strip()
+
+    if match_mode == "contains":
+        mask_per_col = block.apply(
+            lambda col: col.astype(str)
+            .str.lower()
+            .str.contains(a, na=False)
+        )
+    else:  # "equals"
+        mask_per_col = block.apply(
+            lambda col: col.astype(str)
+            .str.lower()
+            .str.strip()
+            .eq(a)
+        )
+
+    return mask_per_col.any(axis=1)
+
+
+def _col_mask(
+        block: pd.DataFrame,
+        anchor: str,
+        match_mode: MatchMode,
+) -> pd.Series:
+    """
+    Return a boolean Series marking columns that contain the anchor
+    in ANY of their values.
+
+    match_mode:
+        "contains" : case-insensitive substring match
+        "equals"   : case-insensitive exact match after strip()
+    """
+    if block.empty:
+        return pd.Series(False, index=block.columns)
+
+    a = str(anchor).lower().strip()
+
+    if match_mode == "contains":
+        mask_per_col = block.astype(str).apply(
+            lambda col: col.str.lower().str.contains(a, na=False)
+        )
+    else:  # "equals"
+        mask_per_col = block.astype(str).apply(
+            lambda col: col.str.lower().str.strip().eq(a)
+        )
+
+    return mask_per_col.any(axis=0)
+
+
+# =====================================================================
+#  Core implementation
+# =====================================================================
+
+def _trim_core(
         df: pd.DataFrame,
-        top=None,  # ("anchor", keep_bool) or None
-        bottom=None,  # ("anchor", keep_bool) or None
-        left=None,  # ("anchor", keep_bool) or None
-        right=None,  # ("anchor", keep_bool) or None
-        max_rows_to_scan: int = 20,
-        max_cols_to_scan: int = 20,
+        *,
+        top: Optional[Tuple[str, bool]],
+        bottom: Optional[Tuple[str, bool]],
+        left: Optional[Tuple[str, bool]],
+        right: Optional[Tuple[str, bool]],
+        max_rows_to_scan: int,
+        max_cols_to_scan: int,
+        match_mode: MatchMode,
 ) -> pd.DataFrame:
     """
-    Universal DataFrame trimming function.
+    Core function implementing the trimming transformation.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input DataFrame to be trimmed.
-
-    top, bottom, left, right : tuple or None
-        Each side can be:
-            None
-        or:
-            ("anchor_string", keep_bool)
-
-        where:
-            keep_bool = True  → keep the row/column that contains the anchor
-            keep_bool = False → remove the row/column that contains the anchor
-
-    max_rows_to_scan : int
-        How many rows from top/bottom to scan for the anchor.
-
-    max_cols_to_scan : int
-        How many columns from left/right to scan for the anchor.
-
-    Returns
-    -------
-    pd.DataFrame
-        Trimmed DataFrame (a copy; the original is not modified).
+    The original DataFrame is not modified; a copy is created and returned.
+    Row indices are reset (RangeIndex) when rows are removed.
+    Column labels are preserved; only column positions are sliced.
     """
-
-    # Work on a copy to avoid accidental modification of the original
     result = df.copy()
 
-    # -----------------------------------------------------------------
-    # Helper: build a boolean row mask for rows that contain the anchor
-    # in ANY column of the given block.
-    #
-    # Normalization:
-    #   - anchor is converted to str, then lower-case, then stripped
-    #   - all data in the block is converted to string, lower-cased
-    #     and then searched with .str.contains()
-    # -----------------------------------------------------------------
-    def row_mask(block: pd.DataFrame, anchor) -> pd.Series:
-        anchor = str(anchor).lower().strip()
-        return block.apply(
-            lambda col: col.astype(str).str.lower().str.contains(anchor, na=False)
-        ).any(axis=1)
-
-    # -----------------------------------------------------------------
-    # Helper: build a boolean column mask for columns that contain the
-    # anchor in ANY of their values.
-    #
-    # Same normalization logic as in row_mask.
-    # -----------------------------------------------------------------
-    def col_mask(block: pd.DataFrame, anchor) -> pd.Series:
-        anchor = str(anchor).lower().strip()
-        return block.astype(str).apply(
-            lambda col: col.str.lower().str.contains(anchor, na=False)
-        ).any(axis=0)
-
-    # =================================================================
-    #                           TRIM TOP
-    # =================================================================
+    # ---------------- TOP ----------------
     if top is not None and not result.empty:
         anchor, keep = top
+        max_rows = min(max_rows_to_scan, len(result))
+        head = result.head(max_rows)
 
-        # Scan only the first `max_rows_to_scan` rows for performance
-        head = result.head(max_rows_to_scan)
-
-        mask = row_mask(head, anchor)
-
+        mask = _row_mask(head, anchor, match_mode)
         if mask.any():
-            # Find the FIRST matching row position within `head`
-            first_pos_in_head = np.where(mask)[0][0]
-            first_label = head.index[first_pos_in_head]
-
-            # Convert index label to positional index in the full DataFrame.
-            # Using get_indexer to be safe even if index is non-unique.
-            pos = result.index.get_indexer([first_label])[0]
-
-            # keep=True  → start slicing from the anchor row
-            # keep=False → start slicing from the row AFTER the anchor
-            start_row = pos + (0 if keep else 1)
-
+            first_pos_in_head = int(np.where(mask.to_numpy())[0][0])
+            start_row = first_pos_in_head + (0 if keep else 1)
             result = result.iloc[start_row:].reset_index(drop=True)
 
-    # =================================================================
-    #                          TRIM BOTTOM
-    # =================================================================
+    # ---------------- BOTTOM ----------------
     if bottom is not None and not result.empty:
         anchor, keep = bottom
+        max_rows = min(max_rows_to_scan, len(result))
+        tail = result.tail(max_rows)
 
-        # Scan only the last `max_rows_to_scan` rows
-        tail = result.tail(max_rows_to_scan)
-
-        mask = row_mask(tail, anchor)
-
+        mask = _row_mask(tail, anchor, match_mode)
         if mask.any():
-            # Find the LAST matching row position within `tail`
-            last_pos_in_tail = np.where(mask)[0][-1]
+            last_pos_in_tail = int(np.where(mask.to_numpy())[0][-1])
             last_label = tail.index[last_pos_in_tail]
 
-            # Convert index label to positional index in the full DataFrame
-            pos = result.index.get_indexer([last_label])[0]
+            pos_in_result = result.index.get_loc(last_label)
+            end_row = pos_in_result + (1 if keep else 0)
+            result = result.iloc[:end_row].reset_index(drop=True)
 
-            # keep=True  → keep anchor row (slice up to pos inclusive)
-            # keep=False → slice up to the row BEFORE anchor
-            end_pos = pos + (1 if keep else 0)
-
-            # iloc stop is exclusive, so end_pos works correctly:
-            #   keep=True  → [:pos+1] includes anchor row
-            #   keep=False → [:pos]   excludes anchor row
-            result = result.iloc[:end_pos].reset_index(drop=True)
-
-    # =================================================================
-    #                           TRIM LEFT
-    # =================================================================
+    # ---------------- LEFT ----------------
     if left is not None and not result.empty:
         anchor, keep = left
-
-        # Scan only the first `max_cols_to_scan` columns
-        left_block = result.iloc[:, :max_cols_to_scan]
+        max_cols = min(max_cols_to_scan, result.shape[1])
+        left_block = result.iloc[:, :max_cols]
 
         if left_block.shape[1] > 0:
-            mask = col_mask(left_block, anchor)
-
+            mask = _col_mask(left_block, anchor, match_mode)
             if mask.any():
-                # First matching column position within `left_block`
-                first_col_in_block = np.where(mask)[0][0]
-
-                # keep=True  → keep anchor column (start from it)
-                # keep=False → drop anchor column (start from next)
+                first_col_in_block = int(np.where(mask.to_numpy())[0][0])
                 start_col = first_col_in_block + (0 if keep else 1)
-
                 result = result.iloc[:, start_col:]
 
-    # =================================================================
-    #                           TRIM RIGHT
-    # =================================================================
+    # ---------------- RIGHT ----------------
     if right is not None and not result.empty:
         anchor, keep = right
-
-        # Scan only the last `max_cols_to_scan` columns
-        right_block = result.iloc[:, -max_cols_to_scan:]
+        max_cols = min(max_cols_to_scan, result.shape[1])
+        right_block = result.iloc[:, -max_cols:]
 
         if right_block.shape[1] > 0:
-            mask = col_mask(right_block, anchor)
-
+            mask = _col_mask(right_block, anchor, match_mode)
             if mask.any():
-                # Offset to convert from relative column index in `right_block`
-                # to absolute column index in `result`
+                last_col_in_block = int(np.where(mask.to_numpy())[0][-1])
                 offset = result.shape[1] - right_block.shape[1]
-
-                # Last matching column position within `right_block`
-                last_col_in_block = np.where(mask)[0][-1]
-
-                # Absolute position in the full DataFrame
                 last_col = offset + last_col_in_block
 
-                # keep=True  → slice including anchor column
-                # keep=False → slice up to the column BEFORE anchor
                 end_col = last_col + (1 if keep else 0)
-
-                # iloc stop is exclusive:
-                #   keep=True  → [:last_col+1] includes anchor column
-                #   keep=False → [:last_col]   excludes anchor column
                 result = result.iloc[:, :end_col]
 
     return result
 
 
 # =====================================================================
-#  Proxy objects enabling clean syntax:
-#      trim_top(df)["Anchor"]
-#      trim_top(df)["Anchor", False]
+#  Public API
 # =====================================================================
 
-class _TopProxy:
+def trim(config: TrimConfig) -> pd.DataFrame:
     """
-    Proxy class that enables syntax like:
+    Main public entry point.
 
-        trim_top(df)["Anchor"]          # keep anchor row
-        trim_top(df)["Anchor", False]   # drop anchor row
+    Expects a dict-like config with keys:
 
-    It stores:
-        - the DataFrame
-        - max_rows_to_scan for top trimming
+        "data_frame"       : pandas.DataFrame              (required)
+        "top"              : (anchor, keep_bool) or None   (optional)
+        "bottom"           : (anchor, keep_bool) or None   (optional)
+        "left"             : (anchor, keep_bool) or None   (optional)
+        "right"            : (anchor, keep_bool) or None   (optional)
+        "max_rows_to_scan" : int >= 1, default 20          (optional)
+        "max_cols_to_scan" : int >= 1, default 20          (optional)
+        "match_mode"       : "contains" or "equals",
+                             default "contains"            (optional)
+
+    All behavior is configured explicitly via this single config dict.
     """
-
-    def __init__(self, df: pd.DataFrame, max_rows_to_scan: int = 20):
-        self.df = df
-        self.max_rows_to_scan = max_rows_to_scan
-
-    def __getitem__(self, key):
-        """
-        key can be:
-            "Anchor"            → interpreted as (anchor="Anchor", keep=True)
-            ("Anchor", False)   → interpreted as (anchor="Anchor", keep=False)
-        """
-        if isinstance(key, tuple):
-            anchor, keep = key
-        else:
-            anchor, keep = key, True
-
-        return trim_df(
-            self.df,
-            top=(anchor, keep),
-            max_rows_to_scan=self.max_rows_to_scan,
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"trim(...) expects a dict as config, got {type(config).__name__}"
         )
 
+    resolved = _validate_trim_config_dict(config)
 
-class _BottomProxy:
-    """
-    Proxy for bottom trimming with syntax:
-
-        trim_bot(df)["Anchor"]
-        trim_bot(df)["Anchor", False]
-    """
-
-    def __init__(self, df: pd.DataFrame, max_rows_to_scan: int = 20):
-        self.df = df
-        self.max_rows_to_scan = max_rows_to_scan
-
-    def __getitem__(self, key):
-        if isinstance(key, tuple):
-            anchor, keep = key
-        else:
-            anchor, keep = key, True
-
-        return trim_df(
-            self.df,
-            bottom=(anchor, keep),
-            max_rows_to_scan=self.max_rows_to_scan,
-        )
-
-
-class _LeftProxy:
-    """
-    Proxy for left-side column trimming:
-
-        trim_left(df)["Anchor"]
-        trim_left(df)["Anchor", False]
-    """
-
-    def __init__(self, df: pd.DataFrame, max_cols_to_scan: int = 20):
-        self.df = df
-        self.max_cols_to_scan = max_cols_to_scan
-
-    def __getitem__(self, key):
-        if isinstance(key, tuple):
-            anchor, keep = key
-        else:
-            anchor, keep = key, True
-
-        return trim_df(
-            self.df,
-            left=(anchor, keep),
-            max_cols_to_scan=self.max_cols_to_scan,
-        )
-
-
-class _RightProxy:
-    """
-    Proxy for right-side column trimming:
-
-        trim_right(df)["Anchor"]
-        trim_right(df)["Anchor", False]
-    """
-
-    def __init__(self, df: pd.DataFrame, max_cols_to_scan: int = 20):
-        self.df = df
-        self.max_cols_to_scan = max_cols_to_scan
-
-    def __getitem__(self, key):
-        if isinstance(key, tuple):
-            anchor, keep = key
-        else:
-            anchor, keep = key, True
-
-        return trim_df(
-            self.df,
-            right=(anchor, keep),
-            max_cols_to_scan=self.max_cols_to_scan,
-        )
-
-
-# =====================================================================
-#  Convenience wrapper functions
-# =====================================================================
-
-def trim_top(df: pd.DataFrame, max_rows_to_scan: int = 20) -> _TopProxy:
-    """
-    Entry point for trimming from the top.
-
-    Usage:
-        trim_top(df)["Anchor"]          # keep row with anchor
-        trim_top(df)["Anchor", False]   # drop row with anchor
-    """
-    return _TopProxy(df, max_rows_to_scan=max_rows_to_scan)
-
-
-def trim_bot(df: pd.DataFrame, max_rows_to_scan: int = 20) -> _BottomProxy:
-    """
-    Entry point for trimming from the bottom.
-
-    Usage:
-        trim_bot(df)["Anchor"]
-        trim_bot(df)["Anchor", False]
-    """
-    return _BottomProxy(df, max_rows_to_scan=max_rows_to_scan)
-
-
-def trim_left(df: pd.DataFrame, max_cols_to_scan: int = 20) -> _LeftProxy:
-    """
-    Entry point for trimming from the left (columns).
-
-    Usage:
-        trim_left(df)["Anchor"]
-        trim_left(df)["Anchor", False]
-    """
-    return _LeftProxy(df, max_cols_to_scan=max_cols_to_scan)
-
-
-def trim_right(df: pd.DataFrame, max_cols_to_scan: int = 20) -> _RightProxy:
-    """
-    Entry point for trimming from the right (columns).
-
-    Usage:
-        trim_right(df)["Anchor"]
-        trim_right(df)["Anchor", False]
-    """
-    return _RightProxy(df, max_cols_to_scan=max_cols_to_scan)
+    df = resolved["data_frame"]
+    return _trim_core(
+        df,
+        top=resolved["top"],
+        bottom=resolved["bottom"],
+        left=resolved["left"],
+        right=resolved["right"],
+        max_rows_to_scan=resolved["max_rows_to_scan"],
+        max_cols_to_scan=resolved["max_cols_to_scan"],
+        match_mode=resolved["match_mode"],
+    )
